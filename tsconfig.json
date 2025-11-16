@@ -17,5 +17,6 @@
 		"noFallthroughCasesInSwitch": true,
 		"types": ["vite/client", "./worker-configuration.d.ts"]
 	},
-	"include": ["client", "worker", "vite.config.ts"]
+	"include": ["client", "worker", "vite.config.ts", "../shared/tldrawSchema.ts", "../shared/shapes"],
+	"exclude": ["../shared/generateTldrawSchema.ts"]
 }

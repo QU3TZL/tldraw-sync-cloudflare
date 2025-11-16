@@ -1,14 +1,16 @@
 
-name = "multiplayer-template"
+name = "tldraw-sync"
 main = "worker/worker.ts"
 compatibility_date = "2025-05-08"
 compatibility_flags = ["nodejs_compat"]
 upload_source_maps = true
 preview_urls = true
 
-[[routes]]
-pattern = "multiplayer.templates.tldraw.dev"
-custom_domain = true
+# Custom domain configuration (optional)
+# Uncomment and update when you have a custom domain:
+# [[routes]]
+# pattern = "sync.yourdomain.com"
+# custom_domain = true
 
 [observability]
 enabled = true
@@ -24,12 +26,15 @@ bindings = [
 ]
 
 # Durable objects require migrations to create/modify/delete them
+# Use new_sqlite_classes for free plan, new_classes for paid plan
 [[migrations]]
 tag = "v1"
-new_classes = ["TldrawDurableObject"]
+new_sqlite_classes = ["TldrawDurableObject"]
 
 # We store rooms and asset uploads in an R2 bucket
+# TODO: Update bucket_name to your R2 bucket name
+# Create bucket in Cloudflare Dashboard → R2 → Create bucket
 [[r2_buckets]]
 binding = 'TLDRAW_BUCKET'
-bucket_name = 'multiplayer-template'
-preview_bucket_name = 'multiplayer-template-preview'
+bucket_name = 'tldraw-content'  # Change this to your bucket name
+preview_bucket_name = 'tldraw-content-preview'  # Optional: for preview environment
