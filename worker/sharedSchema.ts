@@ -41,6 +41,7 @@ export const sharedTldrawSchema = createTLSchema({
         url: { type: "string", default: "" }, // External URL for embedding (Google Calendar, Slides, etc.)
         w: { type: "number", default: 200 },
         h: { type: "number", default: 150 },
+        name: { type: "string", default: "" }, // Editable name for the node
         imageRefs: { type: "array", default: [] },
         documentRefs: { type: "array", default: [] },
         isUserCode: { type: "boolean", default: false },
