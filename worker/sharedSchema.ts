@@ -191,6 +191,24 @@ export const sharedTldrawSchema = createTLSchema({
         },
       },
     },
+    // Custom canvas marker shape - private navigation peg
+    "canvas-marker": {
+      props: {
+        w: { type: "number", default: 150 }, // Larger for visibility at 20% zoom
+        h: { type: "number", default: 150 },
+        name: { type: "string", default: "" },
+        color: { type: "string", default: "#E34234" },
+        markerIndex: { type: "number", default: 0 },
+      },
+      migrations: {
+        firstVersion: 1,
+        currentVersion: 1,
+        migrators: {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          1: { up: (shape: any) => shape, down: (shape: any) => shape },
+        },
+      },
+    },
   },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
 } as any);
