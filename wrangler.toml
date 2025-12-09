@@ -1,5 +1,5 @@
 
-name = "tldraw-sync"
+name = "tldraw-sync-v2"
 main = "worker/worker.ts"
 compatibility_date = "2025-05-08"
 compatibility_flags = ["nodejs_compat"]
@@ -36,5 +36,5 @@ new_sqlite_classes = ["TldrawDurableObject"]
 # Create bucket in Cloudflare Dashboard → R2 → Create bucket
 [[r2_buckets]]
 binding = 'TLDRAW_BUCKET'
-bucket_name = 'tldraw-content'  # Change this to your bucket name
-preview_bucket_name = 'tldraw-content-preview'  # Optional: for preview environment
+bucket_name = 'tldraw-content-v2'  # Change this to your bucket name
+preview_bucket_name = 'tldraw-content-v2-preview'  # Optional: for preview environment

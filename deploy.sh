@@ -6,7 +6,7 @@
 # Usage: ./deploy.sh
 #
 # This script:
-# 1. Switches to Node 22 (required by Vite 7)
+# 1. Switches to Node 20.19.0+ (required by Vite 7)
 # 2. Installs dependencies (including devDependencies)
 # 3. Builds the worker and client
 # 4. Deploys to Cloudflare Workers
@@ -14,7 +14,7 @@
 # Prerequisites:
 # - nvm installed
 # - Cloudflare wrangler authenticated (run `wrangler login` first)
-# - Node 22 installed via nvm (`nvm install 22`)
+# - Node 20.19.0 installed via nvm (`nvm install 20.19.0`)
 #
 # When to run this script:
 # - After adding new custom shapes to worker/sharedSchema.ts
@@ -41,12 +41,12 @@ else
     exit 1
 fi
 
-# Switch to Node 22
-echo "📦 Switching to Node 22..."
-nvm use 22 || {
-    echo "⚠️  Node 22 not installed. Installing..."
-    nvm install 22
-    nvm use 22
+# Switch to Node 20.19.0+
+echo "📦 Switching to Node 20.19.0..."
+nvm use 20.19.0 || {
+    echo "⚠️  Node 20.19.0 not installed. Installing..."
+    nvm install 20.19.0
+    nvm use 20.19.0
 }
 echo "✅ Using Node $(node --version)"
 echo ""

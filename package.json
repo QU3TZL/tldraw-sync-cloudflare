@@ -16,11 +16,11 @@
 		"deploy": "./deploy.sh"
 	},
 	"dependencies": {
-		"@tldraw/editor": "^4.1.2",
-		"@tldraw/sync": "^4.1.2",
-		"@tldraw/sync-core": "^4.1.2",
-		"@tldraw/tldraw": "^4.2.0",
-		"@tldraw/tlschema": "^4.1.2",
+		"@tldraw/editor": "4.1.2",
+		"@tldraw/sync": "4.1.2",
+		"@tldraw/sync-core": "4.1.2",
+		"@tldraw/tldraw": "4.1.2",
+		"@tldraw/tlschema": "4.1.2",
 		"cloudflare-workers-unfurl": "^0.0.8",
 		"itty-router": "^5.0.18",
 		"lodash.throttle": "^4.1.1",
@@ -32,6 +32,7 @@
 	"devDependencies": {
 		"@cloudflare/vite-plugin": "^1.13.2",
 		"@types/lodash.throttle": "^4.1.9",
+		"@types/node": "^20.19.25",
 		"@types/react": "^18.3.18",
 		"@types/react-dom": "^18.3.5",
 		"@vitejs/plugin-react-swc": "^3.10.2",

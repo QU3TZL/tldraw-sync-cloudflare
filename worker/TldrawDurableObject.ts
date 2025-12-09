@@ -1,7 +1,7 @@
 import { RoomSnapshot, TLSocketRoom } from "@tldraw/sync-core";
 import { TLRecord } from "@tldraw/tlschema";
 import { AutoRouter, IRequest, error } from "itty-router";
-import throttle from "lodash.throttle";
+const MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024; // 5 MB guardrail to prevent costly writes
 // Import the shared schema - single source of truth for both client and server
 // This ensures exact schema match and prevents CLIENT_TOO_OLD errors
 import { schema } from "../../shared/tldrawSchema";
@@ -18,6 +18,22 @@ export class TldrawDurableObject {
   // when we load the room from the R2 bucket, we keep it here. it's a promise so we only ever
   // load it once.
   private roomPromise: Promise<TLSocketRoom<TLRecord, void>> | null = null;
+  // Track active WebSocket connections for hibernation
+  private activeConnections = new Set<WebSocket>();
+  // Map sockets to session/room so hibernation lifecycle handlers can forward messages
+  private socketSessions = new Map<
+    WebSocket,
+    { sessionId: string; room: TLSocketRoom<TLRecord, void> }
+  >();
+  // Track latest socket per session to prevent parallel connections
+  private sessionSockets = new Map<string, WebSocket>();
+  // Track last close time per session to apply reconnect backoff
+  private sessionLastCloseAt = new Map<string, number>();
+  private lastPersistAt: number | null = null;
+  // Reconnect backoff window (ms)
+  private static readonly RECONNECT_BACKOFF_MS = 30_000;
+  // Minimum interval between persists (ms)
+  private static readonly MIN_PERSIST_INTERVAL_MS = 10_000;
 
   constructor(private readonly ctx: DurableObjectState, env: Env) {
     this.r2 = env.TLDRAW_BUCKET;
@@ -70,30 +86,51 @@ export class TldrawDurableObject {
     const sessionId = request.query.sessionId as string;
     if (!sessionId) return error(400, "Missing sessionId");
 
+    // Reconnect backoff: if the same session closed recently, reject fast
+    const lastClose = this.sessionLastCloseAt.get(sessionId);
+    if (
+      lastClose &&
+      Date.now() - lastClose < TldrawDurableObject.RECONNECT_BACKOFF_MS
+    ) {
+      console.warn("⚠️ Reconnect backoff: rejecting rapid reconnect", {
+        sessionId,
+        roomId: this.roomId,
+      });
+
+      // Accept and immediately close with rate limit code so client can back off
+      const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair();
+      this.ctx.acceptWebSocket(serverWebSocket);
+      this.sessionLastCloseAt.set(sessionId, Date.now());
+      try {
+        serverWebSocket.close(
+          4001,
+          `RATE_LIMITED:${TldrawDurableObject.RECONNECT_BACKOFF_MS}`
+        );
+      } catch {
+        // ignore
+      }
+      return new Response(null, { status: 101, webSocket: clientWebSocket });
+    }
+
     // Create the websocket pair for the client
     const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair();
-    serverWebSocket.accept();
 
-    // Add error handler to catch CLIENT_TOO_OLD errors
-    serverWebSocket.addEventListener("error", (event) => {
-      console.error("🔴 Server WebSocket error:", event);
-    });
+    // Use acceptWebSocket to enable hibernation - this allows the Durable Object
+    // to hibernate when all WebSockets close, reducing duration charges
+    this.ctx.acceptWebSocket(serverWebSocket);
+    this.activeConnections.add(serverWebSocket);
 
-    serverWebSocket.addEventListener("message", (event) => {
-      // Log first message to see protocol version
+    // Enforce single live socket per sessionId - close any previous one
+    const existing = this.sessionSockets.get(sessionId);
+    if (existing && existing !== serverWebSocket) {
       try {
-        const data = JSON.parse(event.data as string);
-        console.log("📨 Server received message:", {
-          type: data.type,
-          protocolVersion: data.protocolVersion,
-          schemaVersion: data.schemaVersion,
-          data: data,
-        });
-      } catch (e) {
-        // Not JSON, might be binary
-        console.log("📨 Server received non-JSON message:", event.data);
+        existing.close(4000, "replaced_by_new_connection");
+      } catch {
+        // ignore
       }
-    });
+      this.cleanupSocket(existing);
+    }
+    this.sessionSockets.set(sessionId, serverWebSocket);
 
     // load the room, or retrieve it if it's already loaded
     const room = await this.getRoom();
@@ -123,6 +160,7 @@ export class TldrawDurableObject {
       // connect the client to the room
       room.handleSocketConnect({ sessionId, socket: serverWebSocket });
       console.log("✅ Server connected client to room");
+      this.socketSessions.set(serverWebSocket, { sessionId, room });
     } catch (err) {
       console.error("❌ Server error connecting client:", err);
       console.error("❌ Error details:", {
@@ -148,6 +186,10 @@ export class TldrawDurableObject {
           const freshRoom = await this.getRoom();
           freshRoom.handleSocketConnect({ sessionId, socket: serverWebSocket });
           console.log("✅ Reconnected with fresh room after CLIENT_TOO_OLD");
+          this.socketSessions.set(serverWebSocket, {
+            sessionId,
+            room: freshRoom,
+          });
         } catch (retryErr) {
           console.error("❌ Failed to recover from CLIENT_TOO_OLD:", retryErr);
         }
@@ -316,8 +358,17 @@ export class TldrawDurableObject {
   }
 
   // we throttle persistance so it only happens every 10 seconds
-  schedulePersistToR2 = throttle(async () => {
+  schedulePersistToR2 = async () => {
     if (!this.roomPromise || !this.roomId) return;
+    const now = Date.now();
+    // Enforce minimum persist interval to reduce churn
+    if (
+      this.lastPersistAt &&
+      now - this.lastPersistAt < TldrawDurableObject.MIN_PERSIST_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.lastPersistAt = now;
     const room = await this.getRoom();
 
     // convert the room to JSON and upload it to R2
@@ -334,11 +385,26 @@ export class TldrawDurableObject {
         schemaVersion: schemaAny?.version, // Also in metadata for backwards compatibility
       },
     };
-    await this.r2.put(
-      `rooms/${this.roomId}`,
-      JSON.stringify(snapshotWithMetadata)
-    );
-  }, 10_000);
+    const snapshotJson = JSON.stringify(snapshotWithMetadata);
+    const snapshotBytes = new TextEncoder().encode(snapshotJson).byteLength;
+    if (snapshotBytes > MAX_SNAPSHOT_BYTES) {
+      console.error("🔴 Snapshot too large - skipping persist", {
+        roomId: this.roomId,
+        snapshotBytes,
+        maxBytes: MAX_SNAPSHOT_BYTES,
+      });
+      return;
+    }
+
+    const start = Date.now();
+    await this.r2.put(`rooms/${this.roomId}`, snapshotJson);
+    this.lastPersistAt = Date.now();
+    console.log("💾 Persisted room snapshot", {
+      roomId: this.roomId,
+      snapshotBytes,
+      durationMs: Date.now() - start,
+    });
+  };
 
   // Helper method to delete room data (for clearing old incompatible data)
   async deleteRoomData() {
@@ -350,6 +416,139 @@ export class TldrawDurableObject {
       this.roomPromise = null;
     } catch (err) {
       console.error(`❌ Failed to delete room data: ${err}`);
+    }
+  }
+
+  // Hibernation support: route messages to TLSocketRoom when Cloudflare delivers them
+  webSocketMessage(ws: WebSocket, event: MessageEvent) {
+    const session = this.socketSessions.get(ws);
+    if (!session) {
+      console.warn("⚠️ Received message for unknown socket (possibly stale)", {
+        roomId: this.roomId,
+      });
+      return;
+    }
+
+    try {
+      const data = (event as any)?.data ?? event;
+      session.room.handleSocketMessage(session.sessionId, data as any);
+    } catch (err) {
+      console.error("🔴 WebSocket message handling failed:", {
+        error: err instanceof Error ? err.message : String(err),
+        roomId: this.roomId,
+        sessionId: session.sessionId,
+      });
+      session.room.handleSocketError(session.sessionId);
+    }
+  }
+
+  // Hibernation support: Called when a WebSocket closes
+  // This allows the Durable Object to hibernate when all connections close,
+  // which stops accumulating duration charges
+  webSocketClose(ws: WebSocket, event: CloseEvent) {
+    const session = this.socketSessions.get(ws);
+    console.log("🔌 WebSocket closed, object may hibernate:", {
+      code: event.code,
+      reason: event.reason,
+      wasClean: event.wasClean,
+      roomId: this.roomId,
+      remainingConnections: this.activeConnections.size - 1,
+      sessionId: session?.sessionId,
+    });
+
+    if (session) {
+      try {
+        session.room.handleSocketClose(session.sessionId);
+      } catch (err) {
+        console.error("⚠️ Failed to notify room of socket close:", err);
+      }
+      // Track last close to enforce reconnect backoff
+      this.sessionLastCloseAt.set(session.sessionId, Date.now());
+    }
+
+    this.cleanupSocket(ws);
+
+    // If this was the last connection, ensure we persist the room state
+    // before hibernation
+    if (this.activeConnections.size === 0 && this.roomPromise && this.roomId) {
+      console.log(
+        "💤 Last connection closed, persisting room before hibernation"
+      );
+      // Schedule a final persistence - this will run before hibernation
+      this.ctx.waitUntil(
+        (async () => {
+          try {
+            const room = await this.getRoom();
+            const snapshot = room.getCurrentSnapshot();
+            const schemaAny = schema as any;
+            const snapshotWithMetadata = {
+              ...snapshot,
+              schemaVersion: schemaAny?.version,
+              _metadata: {
+                savedAt: new Date().toISOString(),
+                protocolVersion: "4.1.2",
+                schemaVersion: schemaAny?.version,
+              },
+            };
+            const snapshotJson = JSON.stringify(snapshotWithMetadata);
+            const snapshotBytes = new TextEncoder().encode(
+              snapshotJson
+            ).byteLength;
+            if (snapshotBytes > MAX_SNAPSHOT_BYTES) {
+              console.error(
+                "🔴 Final persistence skipped: snapshot too large before hibernation",
+                {
+                  roomId: this.roomId,
+                  snapshotBytes,
+                  maxBytes: MAX_SNAPSHOT_BYTES,
+                }
+              );
+              return;
+            }
+
+            const start = Date.now();
+            await this.r2.put(`rooms/${this.roomId}`, snapshotJson);
+            console.log("✅ Final persistence completed before hibernation", {
+              roomId: this.roomId,
+              snapshotBytes,
+              durationMs: Date.now() - start,
+            });
+          } catch (err) {
+            console.error("❌ Error during final persistence:", err);
+          }
+        })()
+      );
+    }
+  }
+
+  // Hibernation support: Called when a WebSocket error occurs
+  webSocketError(ws: WebSocket, error: Error) {
+    const session = this.socketSessions.get(ws);
+    console.error("🔴 WebSocket error:", {
+      error: error.message,
+      roomId: this.roomId,
+      sessionId: session?.sessionId,
+    });
+
+    if (session) {
+      try {
+        session.room.handleSocketError(session.sessionId);
+      } catch (err) {
+        console.error("⚠️ Failed to notify room of socket error:", err);
+      }
+    }
+    this.cleanupSocket(ws);
+  }
+
+  private cleanupSocket(ws: WebSocket) {
+    this.activeConnections.delete(ws);
+    const session = this.socketSessions.get(ws);
+    if (session) {
+      this.socketSessions.delete(ws);
+      const current = this.sessionSockets.get(session.sessionId);
+      if (current === ws) {
+        this.sessionSockets.delete(session.sessionId);
+      }
     }
   }
 }
