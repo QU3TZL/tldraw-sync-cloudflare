@@ -312,31 +312,32 @@ export class TldrawDurableObject {
                 initialSnapshot = undefined;
               }
             }
-          } catch (sqliteErr) {
-            console.error("❌ SQLite load failed, falling back to R2:", sqliteErr);
-            // Fallback to R2 if SQLite fails
-            const roomFromBucket = await this.r2.get(`rooms/${roomId}`);
-            if (roomFromBucket) {
-              try {
-                const snapshot = (await roomFromBucket.json()) as RoomSnapshot;
-                const snapshotAny = snapshot as any;
-                const currentSchemaVersion = (schema as any)?.version;
-                const snapshotSchemaVersion =
-                  snapshotAny?.schemaVersion ||
-                  snapshotAny?._metadata?.schemaVersion;
+          }
+        } catch (sqliteErr) {
+          console.error("❌ SQLite load failed, falling back to R2:", sqliteErr);
+          // Fallback to R2 if SQLite fails
+          const roomFromBucket = await this.r2.get(`rooms/${roomId}`);
+          if (roomFromBucket) {
+            try {
+              const snapshot = (await roomFromBucket.json()) as RoomSnapshot;
+              const snapshotAny = snapshot as any;
+              const currentSchemaVersion = (schema as any)?.version;
+              const snapshotSchemaVersion =
+                snapshotAny?.schemaVersion ||
+                snapshotAny?._metadata?.schemaVersion;
 
-                if (snapshotSchemaVersion === currentSchemaVersion) {
-                  initialSnapshot = snapshot;
-                  // Try to persist to SQLite for next time
-                  try {
-                    this.persistToSQLite(roomId, snapshot);
-                  } catch {}
-                }
-              } catch (err) {
-                console.error("❌ R2 fallback also failed:", err);
+              if (snapshotSchemaVersion === currentSchemaVersion) {
+                initialSnapshot = snapshot;
+                // Try to persist to SQLite for next time
+                try {
+                  this.persistToSQLite(roomId, snapshot);
+                } catch {}
               }
+            } catch (err) {
+              console.error("❌ R2 fallback also failed:", err);
             }
           }
+        }
 
         // create a new TLSocketRoom. This handles all the sync protocol & websocket connections.
         // it's up to us to persist the room state to R2 when needed though.
