@@ -368,9 +368,20 @@ export class TldrawDurableObject {
                   // Silently fail - R2 is just backup
                 });
               } catch (err) {
-                console.error("❌ Failed to persist to SQLite:", err);
-                // Alert connected clients if persistence fails
-                // (In production, you might want to notify clients)
+                // 🔧 CRITICAL: Synchronous error detection - we know immediately if persistence fails
+                const errorDetails = {
+                  error: err instanceof Error ? err.message : String(err),
+                  stack: err instanceof Error ? err.stack : undefined,
+                  roomId: this.roomId,
+                  timestamp: new Date().toISOString(),
+                  connectedClients: this.activeConnections.size,
+                };
+                
+                console.error("❌ CRITICAL: Failed to persist to SQLite (synchronous error detected):", errorDetails);
+                
+                // Alert all connected clients about persistence failure
+                // This is the key benefit: we know immediately and can notify users
+                this.notifyClientsOfPersistenceError(errorDetails);
               }
             }
           },
@@ -423,6 +434,7 @@ export class TldrawDurableObject {
 
   // 🔧 NEW: Persist to SQLite synchronously (source of truth)
   // This is guaranteed to work or throw an error immediately
+  // KEY BENEFIT: Synchronous error detection - we know immediately if persistence fails
   private persistToSQLite(roomId: string, snapshot: RoomSnapshot) {
     try {
       const schemaAny = schema as any;
@@ -438,7 +450,13 @@ export class TldrawDurableObject {
       const snapshotJson = JSON.stringify(snapshotWithMetadata);
       const now = Date.now();
 
+      // Count presence records in snapshot for observability
+      const presenceCount = Object.values(snapshot).filter(
+        (r: any) => r?.typeName === "instance_presence"
+      ).length;
+
       // Persist synchronously to SQLite
+      // If this fails, we know IMMEDIATELY (synchronous error)
       this.ctx.storage.transactionSync(() => {
         this.ctx.storage.sql.exec(
           `INSERT OR REPLACE INTO room_snapshots 
@@ -455,10 +473,19 @@ export class TldrawDurableObject {
       console.log("💾 Persisted to SQLite (source of truth):", {
         roomId,
         snapshotBytes: new TextEncoder().encode(snapshotJson).byteLength,
+        presenceRecords: presenceCount,
+        totalRecords: Object.keys(snapshot).length,
       });
     } catch (err) {
-      console.error("❌ SQLite persistence failed:", err);
-      throw err; // Re-throw so caller knows persistence failed
+      // 🔧 CRITICAL: This error is detected SYNCHRONOUSLY
+      // Unlike R2 (async, fire-and-forget), we know immediately if this fails
+      console.error("❌ SQLite persistence failed (synchronous error detected):", {
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+        roomId,
+        timestamp: new Date().toISOString(),
+      });
+      throw err; // Re-throw so caller knows persistence failed and can notify clients
     }
   }
 
@@ -547,6 +574,22 @@ export class TldrawDurableObject {
 
     try {
       const data = (event as any)?.data ?? event;
+      
+      // Check if this is a persistence_error message (from our notifyClientsOfPersistenceError)
+      // This allows clients to detect persistence failures
+      if (typeof data === 'string') {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.type === 'persistence_error') {
+            // This is our custom persistence error message - pass it through
+            // Clients can listen for this to show user warnings
+            console.log("📢 Forwarding persistence error to client:", parsed);
+          }
+        } catch {
+          // Not JSON, continue with normal handling
+        }
+      }
+      
       session.room.handleSocketMessage(session.sessionId, data as any);
     } catch (err) {
       console.error("🔴 WebSocket message handling failed:", {
@@ -666,5 +709,42 @@ export class TldrawDurableObject {
         this.sessionSockets.delete(session.sessionId);
       }
     }
+  }
+
+  // 🔧 NEW: Notify all connected clients about persistence failures
+  // This is the key observability benefit: synchronous error detection + client notification
+  private notifyClientsOfPersistenceError(errorDetails: {
+    error: string;
+    stack?: string;
+    roomId: string | null;
+    timestamp: string;
+    connectedClients: number;
+  }) {
+    // Send a custom message to all connected clients
+    // Clients can listen for this and show a warning to users
+    const message = JSON.stringify({
+      type: "persistence_error",
+      error: errorDetails.error,
+      roomId: errorDetails.roomId,
+      timestamp: errorDetails.timestamp,
+      message: "Canvas changes may not be saved. Please refresh and try again.",
+    });
+
+    let notifiedCount = 0;
+    for (const ws of this.activeConnections) {
+      try {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(message);
+          notifiedCount++;
+        }
+      } catch (err) {
+        console.warn("⚠️ Failed to notify client of persistence error:", err);
+      }
+    }
+
+    console.log(`📢 Notified ${notifiedCount} client(s) of persistence failure`, {
+      totalClients: this.activeConnections.size,
+      notified: notifiedCount,
+    });
   }
 }
