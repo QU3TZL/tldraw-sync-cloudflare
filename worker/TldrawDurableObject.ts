@@ -9,15 +9,18 @@ import { schema } from "../../shared/tldrawSchema";
 // each whiteboard room is hosted in a DurableObject:
 // https://developers.cloudflare.com/durable-objects/
 
-// there's only ever one durable object instance per room. it keeps all the room state in memory and
-// handles websocket connections. periodically, it persists the room state to the R2 bucket.
+// 🔧 NEW: Uses SQLite as source of truth for room snapshots (synchronous, guaranteed persistence)
+// R2 is kept as optional backup/history (async, fire-and-forget)
+// This matches tldraw's new persistence strategy for better reliability and lower memory usage
 export class TldrawDurableObject {
   private r2: R2Bucket;
   // the room ID will be missing while the room is being initialized
   private roomId: string | null = null;
-  // when we load the room from the R2 bucket, we keep it here. it's a promise so we only ever
+  // when we load the room from SQLite, we keep it here. it's a promise so we only ever
   // load it once.
   private roomPromise: Promise<TLSocketRoom<TLRecord, void>> | null = null;
+  // Track if SQLite table has been initialized
+  private sqliteInitialized: boolean = false;
   // Track active WebSocket connections for hibernation
   private activeConnections = new Set<WebSocket>();
   // Map sockets to session/room so hibernation lifecycle handlers can forward messages
@@ -42,7 +45,43 @@ export class TldrawDurableObject {
       this.roomId = ((await this.ctx.storage.get("roomId")) ?? null) as
         | string
         | null;
+      
+      // Initialize SQLite table synchronously
+      this.initializeSQLiteTable();
     });
+  }
+
+  // Initialize SQLite table for room snapshots
+  private initializeSQLiteTable() {
+    if (this.sqliteInitialized) return;
+    
+    try {
+      // Create table if it doesn't exist
+      // Store snapshot as JSON text - SQLite handles this efficiently
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(`
+          CREATE TABLE IF NOT EXISTS room_snapshots (
+            room_id TEXT PRIMARY KEY,
+            snapshot TEXT NOT NULL,
+            schema_version TEXT,
+            saved_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          )
+        `);
+        
+        // Create index for faster lookups
+        this.ctx.storage.sql.exec(`
+          CREATE INDEX IF NOT EXISTS idx_room_snapshots_room_id 
+          ON room_snapshots(room_id)
+        `);
+      });
+      
+      this.sqliteInitialized = true;
+      console.log("✅ SQLite table initialized for room snapshots");
+    } catch (err) {
+      console.error("❌ Failed to initialize SQLite table:", err);
+      // Continue anyway - will fall back to R2 if SQLite fails
+    }
   }
 
   private readonly router = AutoRouter({
@@ -206,88 +245,98 @@ export class TldrawDurableObject {
 
     if (!this.roomPromise) {
       this.roomPromise = (async () => {
-        // fetch the room from R2
-        const roomFromBucket = await this.r2.get(`rooms/${roomId}`);
-
-        // if it doesn't exist, we'll just create a new empty room
-        // IMPORTANT: If there's old room data with incompatible protocol version,
-        // we should skip it to avoid CLIENT_TOO_OLD errors
+        // 🔧 NEW: Load from SQLite synchronously (source of truth)
         let initialSnapshot: RoomSnapshot | undefined = undefined;
-        if (roomFromBucket) {
-          try {
-            const snapshot = (await roomFromBucket.json()) as RoomSnapshot;
-            // Check if snapshot has protocol version info
-            console.log("📦 Loaded room snapshot from R2:", {
-              roomId,
-              hasSnapshot: !!snapshot,
-              snapshotKeys: snapshot ? Object.keys(snapshot).slice(0, 5) : [],
-              // Check for protocol version in snapshot
-              hasProtocolVersion: !!(snapshot as any)?.protocolVersion,
-              hasSchemaVersion: !!(snapshot as any)?.schemaVersion,
-            });
-
-            // CRITICAL: Check schema version compatibility to avoid CLIENT_TOO_OLD errors
-            // When schema changes (e.g., adding custom shapes), old snapshots become incompatible
-            const snapshotAny = snapshot as any;
-            const currentSchemaVersion = (schema as any)?.version;
-            const snapshotSchemaVersion =
-              snapshotAny?.schemaVersion ||
-              snapshotAny?._metadata?.schemaVersion;
-
-            // If snapshot doesn't have schema version or versions don't match, skip it
-            // This prevents CLIENT_TOO_OLD errors when schema changes
-            if (!snapshotSchemaVersion) {
-              console.warn(
-                "⚠️ Old snapshot detected (no schema version) - starting fresh to avoid CLIENT_TOO_OLD"
-              );
-              console.warn(
-                "💡 Old room data will be ignored. Room will start fresh."
-              );
-
-              // Delete the old snapshot to prevent future issues
-              try {
-                await this.r2.delete(`rooms/${roomId}`);
-                console.log("🗑️ Deleted old incompatible room data from R2");
-              } catch (deleteErr) {
-                console.warn("⚠️ Failed to delete old room data:", deleteErr);
-              }
-
-              initialSnapshot = undefined;
-            } else if (snapshotSchemaVersion !== currentSchemaVersion) {
-              console.warn(
-                "⚠️ Schema version mismatch detected - starting fresh to avoid CLIENT_TOO_OLD"
-              );
-              console.warn("Current schema version:", currentSchemaVersion);
-              console.warn("Snapshot schema version:", snapshotSchemaVersion);
-              console.warn(
-                "💡 Old room data will be ignored. Room will start fresh."
-              );
-
-              // Delete the old snapshot to prevent future issues
-              try {
-                await this.r2.delete(`rooms/${roomId}`);
-                console.log("🗑️ Deleted old incompatible room data from R2");
-              } catch (deleteErr) {
-                console.warn("⚠️ Failed to delete old room data:", deleteErr);
-              }
-
-              initialSnapshot = undefined;
-            } else {
-              // Schema versions match, safe to use snapshot
-              console.log(
-                "✅ Snapshot schema version matches, loading room data"
-              );
-              initialSnapshot = snapshot;
-            }
-          } catch (err) {
-            console.error(
-              "❌ Failed to parse room snapshot, starting fresh:",
-              err
+        
+        try {
+          // Load from SQLite synchronously - this is fast and guaranteed
+          const sqliteSnapshot = this.ctx.storage.transactionSync(() => {
+            const result = this.ctx.storage.sql.exec<{
+              snapshot: string;
+              schema_version: string | null;
+            }>(
+              `SELECT snapshot, schema_version FROM room_snapshots WHERE room_id = ?`,
+              roomId
             );
-            // Start with empty room if snapshot is corrupted
-            initialSnapshot = undefined;
+            
+            const row = result.one();
+            return row ? JSON.parse(row.snapshot) as RoomSnapshot : null;
+          });
+
+          if (sqliteSnapshot) {
+            console.log("📦 Loaded room snapshot from SQLite:", {
+              roomId,
+              hasSnapshot: !!sqliteSnapshot,
+              snapshotKeys: sqliteSnapshot ? Object.keys(sqliteSnapshot).slice(0, 5) : [],
+            });
+            initialSnapshot = sqliteSnapshot;
+          } else {
+            // No SQLite data - try migrating from R2 (one-time migration)
+            console.log("💡 No SQLite snapshot found, checking R2 for migration...");
+            const roomFromBucket = await this.r2.get(`rooms/${roomId}`);
+            if (roomFromBucket) {
+              try {
+                const snapshot = (await roomFromBucket.json()) as RoomSnapshot;
+                const snapshotAny = snapshot as any;
+                const currentSchemaVersion = (schema as any)?.version;
+                const snapshotSchemaVersion =
+                  snapshotAny?.schemaVersion ||
+                  snapshotAny?._metadata?.schemaVersion;
+
+                // Validate schema version before migrating
+                if (!snapshotSchemaVersion || snapshotSchemaVersion !== currentSchemaVersion) {
+                  console.warn(
+                    "⚠️ R2 snapshot incompatible - skipping migration",
+                    {
+                      hasSchemaVersion: !!snapshotSchemaVersion,
+                      matches: snapshotSchemaVersion === currentSchemaVersion,
+                    }
+                  );
+                  // Delete incompatible R2 snapshot
+                  try {
+                    await this.r2.delete(`rooms/${roomId}`);
+                  } catch {}
+                  initialSnapshot = undefined;
+                } else {
+                  // Migrate from R2 to SQLite
+                  console.log("🔄 Migrating room snapshot from R2 to SQLite...");
+                  initialSnapshot = snapshot;
+                  
+                  // Persist to SQLite immediately (synchronous, guaranteed)
+                  this.persistToSQLite(roomId, snapshot);
+                  
+                  console.log("✅ Migration complete - room now in SQLite");
+                }
+              } catch (err) {
+                console.error("❌ Failed to migrate from R2:", err);
+                initialSnapshot = undefined;
+              }
+            }
+          } catch (sqliteErr) {
+            console.error("❌ SQLite load failed, falling back to R2:", sqliteErr);
+            // Fallback to R2 if SQLite fails
+            const roomFromBucket = await this.r2.get(`rooms/${roomId}`);
+            if (roomFromBucket) {
+              try {
+                const snapshot = (await roomFromBucket.json()) as RoomSnapshot;
+                const snapshotAny = snapshot as any;
+                const currentSchemaVersion = (schema as any)?.version;
+                const snapshotSchemaVersion =
+                  snapshotAny?.schemaVersion ||
+                  snapshotAny?._metadata?.schemaVersion;
+
+                if (snapshotSchemaVersion === currentSchemaVersion) {
+                  initialSnapshot = snapshot;
+                  // Try to persist to SQLite for next time
+                  try {
+                    this.persistToSQLite(roomId, snapshot);
+                  } catch {}
+                }
+              } catch (err) {
+                console.error("❌ R2 fallback also failed:", err);
+              }
+            }
           }
-        }
 
         // create a new TLSocketRoom. This handles all the sync protocol & websocket connections.
         // it's up to us to persist the room state to R2 when needed though.
@@ -307,8 +356,22 @@ export class TldrawDurableObject {
           schema: schema as any, // Type assertion needed - schema is TLSchema but TLSocketRoom expects StoreSchema
           initialSnapshot,
           onDataChange: () => {
-            // and persist whenever the data in the room changes
-            this.schedulePersistToR2();
+            // 🔧 NEW: Persist to SQLite synchronously (guaranteed, immediate error detection)
+            // R2 backup is optional and async (fire-and-forget)
+            if (this.roomId) {
+              try {
+                const snapshot = room.getCurrentSnapshot();
+                this.persistToSQLite(this.roomId, snapshot);
+                // Also backup to R2 (async, optional)
+                this.schedulePersistToR2().catch(() => {
+                  // Silently fail - R2 is just backup
+                });
+              } catch (err) {
+                console.error("❌ Failed to persist to SQLite:", err);
+                // Alert connected clients if persistence fails
+                // (In production, you might want to notify clients)
+              }
+            }
           },
         });
 
@@ -357,7 +420,48 @@ export class TldrawDurableObject {
     return this.roomPromise;
   }
 
-  // we throttle persistance so it only happens every 10 seconds
+  // 🔧 NEW: Persist to SQLite synchronously (source of truth)
+  // This is guaranteed to work or throw an error immediately
+  private persistToSQLite(roomId: string, snapshot: RoomSnapshot) {
+    try {
+      const schemaAny = schema as any;
+      const snapshotWithMetadata = {
+        ...snapshot,
+        schemaVersion: schemaAny?.version,
+        _metadata: {
+          savedAt: new Date().toISOString(),
+          protocolVersion: "4.1.2",
+          schemaVersion: schemaAny?.version,
+        },
+      };
+      const snapshotJson = JSON.stringify(snapshotWithMetadata);
+      const now = Date.now();
+
+      // Persist synchronously to SQLite
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          `INSERT OR REPLACE INTO room_snapshots 
+           (room_id, snapshot, schema_version, saved_at, updated_at) 
+           VALUES (?, ?, ?, ?, ?)`,
+          roomId,
+          snapshotJson,
+          schemaAny?.version || null,
+          now,
+          now
+        );
+      });
+
+      console.log("💾 Persisted to SQLite (source of truth):", {
+        roomId,
+        snapshotBytes: new TextEncoder().encode(snapshotJson).byteLength,
+      });
+    } catch (err) {
+      console.error("❌ SQLite persistence failed:", err);
+      throw err; // Re-throw so caller knows persistence failed
+    }
+  }
+
+  // R2 backup (optional, async, fire-and-forget) - throttled to every 10 seconds
   schedulePersistToR2 = async () => {
     if (!this.roomPromise || !this.roomId) return;
     const now = Date.now();
@@ -371,24 +475,22 @@ export class TldrawDurableObject {
     this.lastPersistAt = now;
     const room = await this.getRoom();
 
-    // convert the room to JSON and upload it to R2
+    // convert the room to JSON and upload it to R2 (backup only)
     const snapshot = room.getCurrentSnapshot();
     const schemaAny = schema as any;
-    // Add metadata to help identify schema version issues
-    // Include schema version so we can detect incompatible snapshots
     const snapshotWithMetadata = {
       ...snapshot,
-      schemaVersion: schemaAny?.version, // Include schema version for compatibility checking
+      schemaVersion: schemaAny?.version,
       _metadata: {
         savedAt: new Date().toISOString(),
-        protocolVersion: "4.1.2", // Mark with current protocol version
-        schemaVersion: schemaAny?.version, // Also in metadata for backwards compatibility
+        protocolVersion: "4.1.2",
+        schemaVersion: schemaAny?.version,
       },
     };
     const snapshotJson = JSON.stringify(snapshotWithMetadata);
     const snapshotBytes = new TextEncoder().encode(snapshotJson).byteLength;
     if (snapshotBytes > MAX_SNAPSHOT_BYTES) {
-      console.error("🔴 Snapshot too large - skipping persist", {
+      console.warn("⚠️ Snapshot too large for R2 backup - skipping", {
         roomId: this.roomId,
         snapshotBytes,
         maxBytes: MAX_SNAPSHOT_BYTES,
@@ -396,13 +498,10 @@ export class TldrawDurableObject {
       return;
     }
 
-    const start = Date.now();
-    await this.r2.put(`rooms/${this.roomId}`, snapshotJson);
-    this.lastPersistAt = Date.now();
-    console.log("💾 Persisted room snapshot", {
-      roomId: this.roomId,
-      snapshotBytes,
-      durationMs: Date.now() - start,
+    // Fire-and-forget R2 backup
+    this.r2.put(`rooms/${this.roomId}`, snapshotJson).catch((err) => {
+      // Silently fail - R2 is just backup, SQLite is source of truth
+      console.warn("⚠️ R2 backup failed (non-critical):", err);
     });
   };
 
@@ -410,8 +509,24 @@ export class TldrawDurableObject {
   async deleteRoomData() {
     if (!this.roomId) return;
     try {
-      await this.r2.delete(`rooms/${this.roomId}`);
-      console.log(`🗑️ Deleted room data for: ${this.roomId}`);
+      // Delete from SQLite (source of truth)
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(
+          `DELETE FROM room_snapshots WHERE room_id = ?`,
+          this.roomId!
+        );
+      });
+      console.log(`🗑️ Deleted room data from SQLite for: ${this.roomId}`);
+      
+      // Also delete from R2 backup
+      try {
+        await this.r2.delete(`rooms/${this.roomId}`);
+        console.log(`🗑️ Deleted room data from R2 for: ${this.roomId}`);
+      } catch (r2Err) {
+        // Non-critical - R2 is just backup
+        console.warn("⚠️ Failed to delete from R2 (non-critical):", r2Err);
+      }
+      
       // Reset room promise so it creates a fresh room
       this.roomPromise = null;
     } catch (err) {
@@ -469,12 +584,12 @@ export class TldrawDurableObject {
     this.cleanupSocket(ws);
 
     // If this was the last connection, ensure we persist the room state
-    // before hibernation
+    // before hibernation (SQLite is already persisted, but backup to R2)
     if (this.activeConnections.size === 0 && this.roomPromise && this.roomId) {
       console.log(
-        "💤 Last connection closed, persisting room before hibernation"
+        "💤 Last connection closed, room already persisted to SQLite"
       );
-      // Schedule a final persistence - this will run before hibernation
+      // Optional: Final R2 backup before hibernation (async, non-critical)
       this.ctx.waitUntil(
         (async () => {
           try {
@@ -495,8 +610,8 @@ export class TldrawDurableObject {
               snapshotJson
             ).byteLength;
             if (snapshotBytes > MAX_SNAPSHOT_BYTES) {
-              console.error(
-                "🔴 Final persistence skipped: snapshot too large before hibernation",
+              console.warn(
+                "⚠️ Final R2 backup skipped: snapshot too large",
                 {
                   roomId: this.roomId,
                   snapshotBytes,
@@ -506,15 +621,15 @@ export class TldrawDurableObject {
               return;
             }
 
-            const start = Date.now();
+            // Fire-and-forget R2 backup
             await this.r2.put(`rooms/${this.roomId}`, snapshotJson);
-            console.log("✅ Final persistence completed before hibernation", {
+            console.log("✅ Final R2 backup completed (optional)", {
               roomId: this.roomId,
               snapshotBytes,
-              durationMs: Date.now() - start,
             });
           } catch (err) {
-            console.error("❌ Error during final persistence:", err);
+            // Non-critical - SQLite is source of truth
+            console.warn("⚠️ Final R2 backup failed (non-critical):", err);
           }
         })()
       );
