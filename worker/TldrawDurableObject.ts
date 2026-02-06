@@ -2,9 +2,65 @@ import { RoomSnapshot, TLSocketRoom } from "@tldraw/sync-core";
 import { TLRecord } from "@tldraw/tlschema";
 import { AutoRouter, IRequest, error } from "itty-router";
 const MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024; // 5 MB guardrail to prevent costly writes
-// Import the shared schema - single source of truth for both client and server
-// This ensures exact schema match and prevents CLIENT_TOO_OLD errors
-import { schema } from "../../shared/tldrawSchema";
+// Import schema generated with createTLSchema (not createTLSchemaFromUtils)
+// TLSocketRoom requires the schema created by createTLSchema with explicit shape definitions
+import { generateTldrawSchema } from "../../shared/generateTldrawSchema";
+
+// Generate schema once at module load time
+const schema = generateTldrawSchema();
+
+/**
+ * Sanitize a room snapshot to remove invalid properties that cause validation errors.
+ * This is needed to clean up data that was stored with older schema versions.
+ * 
+ * Specifically fixes:
+ * - ValidationError: At instance.stylesForNextShape.tldraw:geo: Unexpected property
+ */
+function sanitizeRoomSnapshot(snapshot: RoomSnapshot | null): RoomSnapshot | null {
+  if (!snapshot) return null;
+  
+  try {
+    const snapshotAny = snapshot as any;
+    
+    // Check if there's a documents array (standard tldraw sync format)
+    if (snapshotAny.documents && Array.isArray(snapshotAny.documents)) {
+      for (const doc of snapshotAny.documents) {
+        // Find instance records
+        if (doc.state?.id?.startsWith('instance:')) {
+          const stylesForNextShape = doc.state?.stylesForNextShape;
+          if (stylesForNextShape && typeof stylesForNextShape === 'object') {
+            // Remove invalid tldraw:geo style property (not a valid style key)
+            if ('tldraw:geo' in stylesForNextShape) {
+              console.log('🧹 Sanitizing invalid tldraw:geo from stylesForNextShape');
+              delete stylesForNextShape['tldraw:geo'];
+            }
+          }
+        }
+      }
+    }
+    
+    // Also check clock-based format (older snapshots)
+    if (snapshotAny.clock !== undefined && snapshotAny.documents === undefined) {
+      // This might be a different snapshot format - iterate over all keys
+      for (const key of Object.keys(snapshotAny)) {
+        if (key.startsWith('instance:')) {
+          const instance = snapshotAny[key];
+          if (instance?.stylesForNextShape && typeof instance.stylesForNextShape === 'object') {
+            if ('tldraw:geo' in instance.stylesForNextShape) {
+              console.log('🧹 Sanitizing invalid tldraw:geo from instance stylesForNextShape');
+              delete instance.stylesForNextShape['tldraw:geo'];
+            }
+          }
+        }
+      }
+    }
+    
+    return snapshot;
+  } catch (err) {
+    console.error('⚠️ Error sanitizing snapshot:', err);
+    return snapshot; // Return original if sanitization fails
+  }
+}
 
 // each whiteboard room is hosted in a DurableObject:
 // https://developers.cloudflare.com/durable-objects/
@@ -34,7 +90,7 @@ export class TldrawDurableObject {
   private sessionLastCloseAt = new Map<string, number>();
   private lastPersistAt: number | null = null;
   // Reconnect backoff window (ms)
-  private static readonly RECONNECT_BACKOFF_MS = 30_000;
+  private static readonly RECONNECT_BACKOFF_MS = 2_000;
   // Minimum interval between persists (ms)
   private static readonly MIN_PERSIST_INTERVAL_MS = 10_000;
 
@@ -139,7 +195,9 @@ export class TldrawDurableObject {
       // Accept and immediately close with rate limit code so client can back off
       const { 0: clientWebSocket, 1: serverWebSocket } = new WebSocketPair();
       this.ctx.acceptWebSocket(serverWebSocket);
-      this.sessionLastCloseAt.set(sessionId, Date.now());
+      // NOTE: Do NOT reset sessionLastCloseAt here — resetting on every rejection
+      // makes the backoff permanent (the timer never expires). Only real connection
+      // closes should set this timestamp.
       try {
         serverWebSocket.close(
           4001,
@@ -269,7 +327,8 @@ export class TldrawDurableObject {
               hasSnapshot: !!sqliteSnapshot,
               snapshotKeys: sqliteSnapshot ? Object.keys(sqliteSnapshot).slice(0, 5) : [],
             });
-            initialSnapshot = sqliteSnapshot;
+            // 🧹 Sanitize snapshot to remove invalid properties (e.g., tldraw:geo)
+            initialSnapshot = sanitizeRoomSnapshot(sqliteSnapshot) ?? undefined;
           } else {
             // No SQLite data - try migrating from R2 (one-time migration)
             console.log("💡 No SQLite snapshot found, checking R2 for migration...");
@@ -300,10 +359,14 @@ export class TldrawDurableObject {
                 } else {
                   // Migrate from R2 to SQLite
                   console.log("🔄 Migrating room snapshot from R2 to SQLite...");
-                  initialSnapshot = snapshot;
+                  // 🧹 Sanitize snapshot to remove invalid properties (e.g., tldraw:geo)
+                  const sanitizedSnapshot = sanitizeRoomSnapshot(snapshot);
+                  initialSnapshot = sanitizedSnapshot ?? undefined;
                   
-                  // Persist to SQLite immediately (synchronous, guaranteed)
-                  this.persistToSQLite(roomId, snapshot);
+                  // Persist sanitized version to SQLite immediately (synchronous, guaranteed)
+                  if (sanitizedSnapshot) {
+                    this.persistToSQLite(roomId, sanitizedSnapshot);
+                  }
                   
                   console.log("✅ Migration complete - room now in SQLite");
                 }
@@ -327,10 +390,14 @@ export class TldrawDurableObject {
                 snapshotAny?._metadata?.schemaVersion;
 
               if (snapshotSchemaVersion === currentSchemaVersion) {
-                initialSnapshot = snapshot;
-                // Try to persist to SQLite for next time
+                // 🧹 Sanitize snapshot to remove invalid properties (e.g., tldraw:geo)
+                const sanitizedSnapshot = sanitizeRoomSnapshot(snapshot);
+                initialSnapshot = sanitizedSnapshot ?? undefined;
+                // Try to persist sanitized version to SQLite for next time
                 try {
-                  this.persistToSQLite(roomId, snapshot);
+                  if (sanitizedSnapshot) {
+                    this.persistToSQLite(roomId, sanitizedSnapshot);
+                  }
                 } catch {}
               }
             } catch (err) {
@@ -368,20 +435,9 @@ export class TldrawDurableObject {
                   // Silently fail - R2 is just backup
                 });
               } catch (err) {
-                // 🔧 CRITICAL: Synchronous error detection - we know immediately if persistence fails
-                const errorDetails = {
-                  error: err instanceof Error ? err.message : String(err),
-                  stack: err instanceof Error ? err.stack : undefined,
-                  roomId: this.roomId,
-                  timestamp: new Date().toISOString(),
-                  connectedClients: this.activeConnections.size,
-                };
-                
-                console.error("❌ CRITICAL: Failed to persist to SQLite (synchronous error detected):", errorDetails);
-                
-                // Alert all connected clients about persistence failure
-                // This is the key benefit: we know immediately and can notify users
-                this.notifyClientsOfPersistenceError(errorDetails);
+                console.error("❌ Failed to persist to SQLite:", err);
+                // Alert connected clients if persistence fails
+                // (In production, you might want to notify clients)
               }
             }
           },
@@ -434,7 +490,6 @@ export class TldrawDurableObject {
 
   // 🔧 NEW: Persist to SQLite synchronously (source of truth)
   // This is guaranteed to work or throw an error immediately
-  // KEY BENEFIT: Synchronous error detection - we know immediately if persistence fails
   private persistToSQLite(roomId: string, snapshot: RoomSnapshot) {
     try {
       const schemaAny = schema as any;
@@ -450,13 +505,7 @@ export class TldrawDurableObject {
       const snapshotJson = JSON.stringify(snapshotWithMetadata);
       const now = Date.now();
 
-      // Count presence records in snapshot for observability
-      const presenceCount = Object.values(snapshot).filter(
-        (r: any) => r?.typeName === "instance_presence"
-      ).length;
-
       // Persist synchronously to SQLite
-      // If this fails, we know IMMEDIATELY (synchronous error)
       this.ctx.storage.transactionSync(() => {
         this.ctx.storage.sql.exec(
           `INSERT OR REPLACE INTO room_snapshots 
@@ -473,19 +522,10 @@ export class TldrawDurableObject {
       console.log("💾 Persisted to SQLite (source of truth):", {
         roomId,
         snapshotBytes: new TextEncoder().encode(snapshotJson).byteLength,
-        presenceRecords: presenceCount,
-        totalRecords: Object.keys(snapshot).length,
       });
     } catch (err) {
-      // 🔧 CRITICAL: This error is detected SYNCHRONOUSLY
-      // Unlike R2 (async, fire-and-forget), we know immediately if this fails
-      console.error("❌ SQLite persistence failed (synchronous error detected):", {
-        error: err instanceof Error ? err.message : String(err),
-        stack: err instanceof Error ? err.stack : undefined,
-        roomId,
-        timestamp: new Date().toISOString(),
-      });
-      throw err; // Re-throw so caller knows persistence failed and can notify clients
+      console.error("❌ SQLite persistence failed:", err);
+      throw err; // Re-throw so caller knows persistence failed
     }
   }
 
@@ -574,22 +614,6 @@ export class TldrawDurableObject {
 
     try {
       const data = (event as any)?.data ?? event;
-      
-      // Check if this is a persistence_error message (from our notifyClientsOfPersistenceError)
-      // This allows clients to detect persistence failures
-      if (typeof data === 'string') {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.type === 'persistence_error') {
-            // This is our custom persistence error message - pass it through
-            // Clients can listen for this to show user warnings
-            console.log("📢 Forwarding persistence error to client:", parsed);
-          }
-        } catch {
-          // Not JSON, continue with normal handling
-        }
-      }
-      
       session.room.handleSocketMessage(session.sessionId, data as any);
     } catch (err) {
       console.error("🔴 WebSocket message handling failed:", {
@@ -709,42 +733,5 @@ export class TldrawDurableObject {
         this.sessionSockets.delete(session.sessionId);
       }
     }
-  }
-
-  // 🔧 NEW: Notify all connected clients about persistence failures
-  // This is the key observability benefit: synchronous error detection + client notification
-  private notifyClientsOfPersistenceError(errorDetails: {
-    error: string;
-    stack?: string;
-    roomId: string | null;
-    timestamp: string;
-    connectedClients: number;
-  }) {
-    // Send a custom message to all connected clients
-    // Clients can listen for this and show a warning to users
-    const message = JSON.stringify({
-      type: "persistence_error",
-      error: errorDetails.error,
-      roomId: errorDetails.roomId,
-      timestamp: errorDetails.timestamp,
-      message: "Canvas changes may not be saved. Please refresh and try again.",
-    });
-
-    let notifiedCount = 0;
-    for (const ws of this.activeConnections) {
-      try {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(message);
-          notifiedCount++;
-        }
-      } catch (err) {
-        console.warn("⚠️ Failed to notify client of persistence error:", err);
-      }
-    }
-
-    console.log(`📢 Notified ${notifiedCount} client(s) of persistence failure`, {
-      totalClients: this.activeConnections.size,
-      notified: notifiedCount,
-    });
   }
 }
