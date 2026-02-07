@@ -21,6 +21,7 @@
 		"@tldraw/sync-core": "4.1.2",
 		"@tldraw/tldraw": "4.1.2",
 		"@tldraw/tlschema": "4.1.2",
+		"@tldraw/validate": "4.1.2",
 		"cloudflare-workers-unfurl": "^0.0.8",
 		"itty-router": "^5.0.18",
 		"lodash.throttle": "^4.1.1",

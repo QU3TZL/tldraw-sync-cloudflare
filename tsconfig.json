@@ -22,7 +22,8 @@
 		"paths": {
 			"@tldraw/tldraw": ["./node_modules/@tldraw/tldraw"],
 			"@tldraw/tlschema": ["./node_modules/@tldraw/tlschema"],
-			"@tldraw/editor": ["./node_modules/@tldraw/editor"]
+			"@tldraw/editor": ["./node_modules/@tldraw/editor"],
+			"@tldraw/validate": ["./node_modules/@tldraw/validate"]
 		}
 	},
 	"include": ["client", "worker", "vite.config.ts", "../shared/tldrawSchema.ts", "../shared/shapes"],

@@ -23,6 +23,10 @@ export default defineConfig(() => {
           __dirname,
           "node_modules/@tldraw/tlschema"
         ),
+        "@tldraw/validate": path.resolve(
+          __dirname,
+          "node_modules/@tldraw/validate"
+        ),
       },
     },
   };
