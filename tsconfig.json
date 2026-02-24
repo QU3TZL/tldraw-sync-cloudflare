@@ -27,5 +27,5 @@
 		}
 	},
 	"include": ["client", "worker", "vite.config.ts", "../shared/tldrawSchema.ts", "../shared/shapes"],
-	"exclude": ["../shared/generateTldrawSchema.ts"]
+	"exclude": []
 }
