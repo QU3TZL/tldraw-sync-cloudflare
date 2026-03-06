@@ -7,38 +7,64 @@ const MAX_SNAPSHOT_BYTES = 5 * 1024 * 1024; // 5 MB guardrail to prevent costly 
 import { schema } from "../../shared/tldrawSchema";
 
 /**
- * Sanitize a room snapshot to remove invalid properties that cause validation errors.
+ * Default prop values for custom shapes that may have been stored before
+ * the prop was added to the schema. Keyed by shape type, then prop name.
+ */
+const SHAPE_PROP_DEFAULTS: Record<string, Record<string, unknown>> = {
+  'canvas-marker': { zoomLevel: 1 },
+  stl: {
+    stlId: '', fileName: '', fileSize: 0, mimeType: '',
+    r2Url: '', w: 400, h: 300,
+    rotationX: 0, rotationY: 0, rotationZ: 0,
+    scale: 1, wireframe: false, isLoaded: false, thumbnailUrl: '',
+  },
+};
+
+/**
+ * Sanitize a room snapshot to fix invalid/missing properties that cause validation errors.
  * This is needed to clean up data that was stored with older schema versions.
- * 
- * Specifically fixes:
- * - ValidationError: At instance.stylesForNextShape.tldraw:geo: Unexpected property
+ *
+ * Fixes:
+ * - instance.stylesForNextShape.tldraw:geo: Unexpected property
+ * - canvas-marker shapes missing zoomLevel (added after initial v1 schema)
  */
 function sanitizeRoomSnapshot(snapshot: RoomSnapshot | null): RoomSnapshot | null {
   if (!snapshot) return null;
-  
+
   try {
     const snapshotAny = snapshot as any;
-    
-    // Check if there's a documents array (standard tldraw sync format)
+
     if (snapshotAny.documents && Array.isArray(snapshotAny.documents)) {
       for (const doc of snapshotAny.documents) {
-        // Find instance records
-        if (doc.state?.id?.startsWith('instance:')) {
-          const stylesForNextShape = doc.state?.stylesForNextShape;
-          if (stylesForNextShape && typeof stylesForNextShape === 'object') {
-            // Remove invalid tldraw:geo style property (not a valid style key)
-            if ('tldraw:geo' in stylesForNextShape) {
-              console.log('🧹 Sanitizing invalid tldraw:geo from stylesForNextShape');
-              delete stylesForNextShape['tldraw:geo'];
+        const state = doc.state;
+        if (!state) continue;
+
+        // Fix instance records: remove invalid tldraw:geo style
+        if (state.id?.startsWith('instance:')) {
+          const styles = state.stylesForNextShape;
+          if (styles && typeof styles === 'object' && 'tldraw:geo' in styles) {
+            console.log('🧹 Sanitizing invalid tldraw:geo from stylesForNextShape');
+            delete styles['tldraw:geo'];
+          }
+        }
+
+        // Fix shapes with missing required props
+        if (state.typeName === 'shape' && state.type && state.props) {
+          const defaults = SHAPE_PROP_DEFAULTS[state.type];
+          if (defaults) {
+            for (const [prop, fallback] of Object.entries(defaults)) {
+              if (state.props[prop] === undefined || state.props[prop] === null) {
+                console.log(`🧹 Patching ${state.type}.props.${prop} → ${fallback}`);
+                state.props[prop] = fallback;
+              }
             }
           }
         }
       }
     }
-    
-    // Also check clock-based format (older snapshots)
+
+    // Also handle clock-based format (older snapshots)
     if (snapshotAny.clock !== undefined && snapshotAny.documents === undefined) {
-      // This might be a different snapshot format - iterate over all keys
       for (const key of Object.keys(snapshotAny)) {
         if (key.startsWith('instance:')) {
           const instance = snapshotAny[key];
@@ -51,11 +77,11 @@ function sanitizeRoomSnapshot(snapshot: RoomSnapshot | null): RoomSnapshot | nul
         }
       }
     }
-    
+
     return snapshot;
   } catch (err) {
     console.error('⚠️ Error sanitizing snapshot:', err);
-    return snapshot; // Return original if sanitization fails
+    return snapshot;
   }
 }
 
@@ -67,6 +93,8 @@ function sanitizeRoomSnapshot(snapshot: RoomSnapshot | null): RoomSnapshot | nul
 // This matches tldraw's new persistence strategy for better reliability and lower memory usage
 export class TldrawDurableObject {
   private r2: R2Bucket;
+  private backendApiUrl: string;
+  private backendApiKey: string;
   // the room ID will be missing while the room is being initialized
   private roomId: string | null = null;
   // when we load the room from SQLite, we keep it here. it's a promise so we only ever
@@ -93,6 +121,8 @@ export class TldrawDurableObject {
 
   constructor(private readonly ctx: DurableObjectState, env: Env) {
     this.r2 = env.TLDRAW_BUCKET;
+    this.backendApiUrl = env.BACKEND_API_URL || "";
+    this.backendApiKey = env.BACKEND_API_KEY || "";
 
     ctx.blockConcurrencyWhile(async () => {
       this.roomId = ((await this.ctx.storage.get("roomId")) ?? null) as
@@ -294,6 +324,107 @@ export class TldrawDurableObject {
     return new Response(null, { status: 101, webSocket: clientWebSocket });
   }
 
+  /**
+   * Extract project ID from room ID format "canvas-{projectId}".
+   * Returns null if the room ID doesn't follow the expected format.
+   */
+  private extractProjectId(roomId: string): string | null {
+    if (roomId.startsWith("canvas-")) {
+      return roomId.slice("canvas-".length);
+    }
+    return null;
+  }
+
+  /**
+   * Seed room data from the backend database when local storage is empty.
+   * Converts the backend's loadSnapshot format to tldraw's RoomSnapshot format.
+   */
+  private async seedFromBackend(roomId: string): Promise<RoomSnapshot | undefined> {
+    if (!this.backendApiUrl || !this.backendApiKey) {
+      console.log("⏭️ Backend seeding skipped — BACKEND_API_URL or BACKEND_API_KEY not configured");
+      return undefined;
+    }
+
+    const projectId = this.extractProjectId(roomId);
+    if (!projectId) {
+      console.warn("⚠️ Cannot extract project ID from room ID:", roomId);
+      return undefined;
+    }
+
+    try {
+      const url = `${this.backendApiUrl}/api/canvas/state/internal/seed/${projectId}`;
+      console.log("🌱 Seeding room from backend database:", { roomId, projectId, url });
+
+      const response = await fetch(url, {
+        headers: {
+          "X-Internal-API-Key": this.backendApiKey,
+          "Accept": "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        console.warn("⚠️ Backend seed request failed:", {
+          status: response.status,
+          statusText: response.statusText,
+        });
+        return undefined;
+      }
+
+      const data = await response.json() as {
+        success: boolean;
+        canvas_data: { store: Record<string, any>; schema?: any } | null;
+        version: number;
+        error?: string;
+      };
+
+      if (!data.success || !data.canvas_data) {
+        console.log("🌱 Backend has no canvas data for this project (new project)");
+        return undefined;
+      }
+
+      const store = data.canvas_data.store;
+      if (!store || typeof store !== "object") {
+        console.warn("⚠️ Backend canvas_data.store is empty or invalid");
+        return undefined;
+      }
+
+      const records = Object.values(store);
+      console.log("🌱 Converting backend snapshot to RoomSnapshot:", {
+        recordCount: records.length,
+        version: data.version,
+      });
+
+      // Convert backend's { store: Record<id, TLRecord> } format
+      // to tldraw sync's { documents: Array<{ state, lastChangedClock }> } format
+      const documents = records.map((record: any, index: number) => ({
+        state: record,
+        lastChangedClock: index,
+      }));
+
+      const rawSnapshot: RoomSnapshot = {
+        documents,
+        clock: documents.length,
+        schema: data.canvas_data.schema,
+      };
+
+      // Sanitize before persisting so missing props (e.g. stl.isLoaded) are
+      // patched at seed time — not just at load time from SQLite.
+      const roomSnapshot = sanitizeRoomSnapshot(rawSnapshot) ?? rawSnapshot;
+
+      // Persist to SQLite immediately so we never need to seed again
+      this.persistToSQLite(roomId, roomSnapshot);
+      console.log("🌱 Backend seed complete — persisted to SQLite:", {
+        roomId,
+        documentCount: documents.length,
+      });
+
+      return roomSnapshot;
+    } catch (err) {
+      console.error("❌ Backend seed failed:", err);
+      return undefined;
+    }
+  }
+
   getRoom() {
     const roomId = this.roomId;
     if (!roomId) throw new Error("Missing roomId");
@@ -372,6 +503,12 @@ export class TldrawDurableObject {
                 initialSnapshot = undefined;
               }
             }
+
+            // Last resort: seed from the backend database
+            if (!initialSnapshot) {
+              console.log("🌱 No local data found — attempting to seed from backend database...");
+              initialSnapshot = await this.seedFromBackend(roomId);
+            }
           }
         } catch (sqliteErr) {
           console.error("❌ SQLite load failed, falling back to R2:", sqliteErr);
@@ -400,6 +537,12 @@ export class TldrawDurableObject {
             } catch (err) {
               console.error("❌ R2 fallback also failed:", err);
             }
+          }
+
+          // R2 fallback also came up empty — try backend seed
+          if (!initialSnapshot) {
+            console.log("🌱 R2 fallback empty — attempting to seed from backend database...");
+            initialSnapshot = await this.seedFromBackend(roomId);
           }
         }
 
